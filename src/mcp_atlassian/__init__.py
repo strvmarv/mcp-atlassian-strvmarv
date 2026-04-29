@@ -45,10 +45,12 @@ from mcp_atlassian.utils.lifecycle import (
 from mcp_atlassian.utils.logging import setup_logging
 
 try:
-    __version__ = version("mcp-atlassian")
+    __version__ = version("mcp-atlassian-strvmarv")
 except PackageNotFoundError:
-    # package is not installed
-    __version__ = "0.0.0"
+    try:
+        __version__ = version("mcp-atlassian")
+    except PackageNotFoundError:
+        __version__ = "0.0.0"
 
 # Initialize logging with appropriate level
 logging_level = logging.WARNING
@@ -114,7 +116,7 @@ async def _run_stdio_with_stdin_guard(run_kwargs: dict[str, object]) -> None:
             raise server_result[0]
 
 
-@click.version_option(__version__, prog_name="mcp-atlassian")
+@click.version_option(__version__, prog_name="mcp-atlassian-strvmarv")
 @click.command()
 @click.option(
     "-v",
@@ -290,6 +292,9 @@ def main(
 
     global logger
     logger = setup_logging(current_logging_level, logging_stream)
+    logger.warning(
+        f"mcp-atlassian-strvmarv {__version__} (fork of sooperset/mcp-atlassian)"
+    )
     logger.debug(f"Logging level set to: {logging.getLevelName(current_logging_level)}")
     logger.debug(
         f"Logging stream set to: {'stdout' if logging_stream is sys.stdout else 'stderr'}"

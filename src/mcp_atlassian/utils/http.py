@@ -1,0 +1,306 @@
+"""Shared HTTP layer hardening: retry, Retry-After respect, concurrency cap.
+
+Both helpers patch adapters in place rather than mounting replacements so they
+compose with `configure_ssl_verification` (which may mount its own
+SSLIgnoreAdapter for self-hosted instances with private CAs).
+
+Call order in clients: configure_ssl_verification -> configure_retry ->
+configure_concurrency.
+"""
+
+import logging
+import os
+import threading
+import time
+
+from requests import Session
+from requests.adapters import BaseAdapter
+from urllib3.util.retry import Retry
+
+logger = logging.getLogger("mcp-atlassian.http")
+
+DEFAULT_RETRY_TOTAL = 5
+DEFAULT_RETRY_BACKOFF = 1.0
+DEFAULT_RETRY_STATUSES = (429, 502, 503, 504)
+DEFAULT_MAX_CONCURRENT_REQUESTS = 4
+_READ_METHODS = frozenset(["GET", "HEAD", "OPTIONS"])
+_ALL_METHODS = frozenset(
+    ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
+)
+_THROTTLED_ATTR = "_strvmarv_throttled"
+_RATE_LIMITED_ATTR = "_strvmarv_rate_limited"
+
+_concurrency_semaphore: threading.BoundedSemaphore | None = None
+_concurrency_semaphore_cap: int | None = None
+_concurrency_init_lock = threading.Lock()
+
+
+class _TokenBucket:
+    """Simple thread-safe token bucket. Rate is steady-state tokens/second;
+    capacity equals one second of tokens (small burst tolerance)."""
+
+    def __init__(self, rate: float) -> None:
+        self.rate = rate
+        self.capacity = max(1.0, rate)
+        self.tokens = self.capacity
+        self.last = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self) -> None:
+        if self.rate <= 0:
+            return
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                elapsed = now - self.last
+                self.last = now
+                self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                wait = (1.0 - self.tokens) / self.rate
+            time.sleep(wait)
+
+
+_rate_limit_bucket: _TokenBucket | None = None
+_rate_limit_bucket_rate: float | None = None
+_rate_limit_init_lock = threading.Lock()
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid int for %s=%r; using default %d", name, raw, default)
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid float for %s=%r; using default %s", name, raw, default
+        )
+        return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def configure_retry(session: Session, *, service: str = "atlassian") -> None:
+    """Apply a urllib3 Retry policy to all adapters on the session.
+
+    Env knobs:
+      ATLASSIAN_RETRY_TOTAL          (int,   default 5; <=0 disables)
+      ATLASSIAN_RETRY_BACKOFF        (float, default 1.0 seconds — exponential factor)
+      ATLASSIAN_RETRY_INCLUDE_WRITES (bool,  default false; if true also retries
+                                     POST/PUT/PATCH/DELETE — only safe when the
+                                     server is known to be idempotent for them)
+
+    Retries fire on 429, 502, 503, 504 and on connection errors. Retry-After
+    header is respected when present.
+    """
+    total = _int_env("ATLASSIAN_RETRY_TOTAL", DEFAULT_RETRY_TOTAL)
+    if total <= 0:
+        logger.info("%s: retry disabled (ATLASSIAN_RETRY_TOTAL=%d)", service, total)
+        return
+
+    backoff = _float_env("ATLASSIAN_RETRY_BACKOFF", DEFAULT_RETRY_BACKOFF)
+    include_writes = _bool_env("ATLASSIAN_RETRY_INCLUDE_WRITES", False)
+    methods = _ALL_METHODS if include_writes else _READ_METHODS
+
+    retry = Retry(
+        total=total,
+        connect=total,
+        read=total,
+        status=total,
+        backoff_factor=backoff,
+        status_forcelist=list(DEFAULT_RETRY_STATUSES),
+        allowed_methods=methods,
+        respect_retry_after_header=True,
+        raise_on_status=False,
+    )
+
+    if not session.adapters:
+        return
+
+    for adapter in session.adapters.values():
+        adapter.max_retries = retry
+
+    logger.debug(
+        "%s: retry configured total=%d backoff=%.2fs statuses=%s writes=%s",
+        service,
+        total,
+        backoff,
+        DEFAULT_RETRY_STATUSES,
+        include_writes,
+    )
+
+
+def _get_concurrency_semaphore(cap: int) -> threading.BoundedSemaphore:
+    """Return a process-wide BoundedSemaphore keyed off the first observed cap.
+
+    First caller wins; subsequent callers with a different cap log a warning and
+    keep the existing semaphore so all sessions actually share the cap.
+    """
+    global _concurrency_semaphore, _concurrency_semaphore_cap
+    if _concurrency_semaphore is not None:
+        if _concurrency_semaphore_cap != cap:
+            logger.warning(
+                "Concurrency cap already initialized at %d; ignoring request for %d",
+                _concurrency_semaphore_cap,
+                cap,
+            )
+        return _concurrency_semaphore
+    with _concurrency_init_lock:
+        if _concurrency_semaphore is None:
+            _concurrency_semaphore = threading.BoundedSemaphore(cap)
+            _concurrency_semaphore_cap = cap
+    return _concurrency_semaphore
+
+
+def _reset_concurrency_semaphore_for_tests() -> None:
+    """Test-only: drop the cached semaphore so each test starts clean."""
+    global _concurrency_semaphore, _concurrency_semaphore_cap
+    with _concurrency_init_lock:
+        _concurrency_semaphore = None
+        _concurrency_semaphore_cap = None
+
+
+def _wrap_adapter_send(
+    adapter: BaseAdapter, sem: threading.BoundedSemaphore
+) -> None:
+    if getattr(adapter, _THROTTLED_ATTR, False):
+        return
+    original_send = adapter.send
+
+    def throttled_send(*args: object, **kwargs: object) -> object:
+        with sem:
+            return original_send(*args, **kwargs)
+
+    adapter.send = throttled_send  # type: ignore[method-assign]
+    setattr(adapter, _THROTTLED_ATTR, True)
+
+
+def configure_concurrency(session: Session, *, service: str = "atlassian") -> None:
+    """Cap concurrent outbound requests across the whole process.
+
+    Wraps `adapter.send` on every mounted adapter with a BoundedSemaphore.acquire.
+    The semaphore is process-wide, so the cap applies to ALL sessions combined
+    (both Jira and Confluence) — which is the right scope for protecting a
+    single self-hosted Atlassian instance.
+
+    Env knobs:
+      ATLASSIAN_MAX_CONCURRENT_REQUESTS (int, default 4; <=0 disables)
+    """
+    cap = _int_env(
+        "ATLASSIAN_MAX_CONCURRENT_REQUESTS", DEFAULT_MAX_CONCURRENT_REQUESTS
+    )
+    if cap <= 0:
+        logger.info(
+            "%s: concurrency cap disabled (ATLASSIAN_MAX_CONCURRENT_REQUESTS=%d)",
+            service,
+            cap,
+        )
+        return
+
+    sem = _get_concurrency_semaphore(cap)
+    if not session.adapters:
+        return
+    for adapter in session.adapters.values():
+        _wrap_adapter_send(adapter, sem)
+    logger.debug("%s: concurrency cap=%d applied to %d adapter(s)",
+                 service, cap, len(session.adapters))
+
+
+def _get_rate_limit_bucket(rate: float) -> _TokenBucket:
+    """Process-wide token bucket. First-caller wins on rate."""
+    global _rate_limit_bucket, _rate_limit_bucket_rate
+    if _rate_limit_bucket is not None:
+        if _rate_limit_bucket_rate != rate:
+            logger.warning(
+                "Rate limit already initialized at %.2f rps; ignoring request for %.2f",
+                _rate_limit_bucket_rate,
+                rate,
+            )
+        return _rate_limit_bucket
+    with _rate_limit_init_lock:
+        if _rate_limit_bucket is None:
+            _rate_limit_bucket = _TokenBucket(rate)
+            _rate_limit_bucket_rate = rate
+    return _rate_limit_bucket
+
+
+def _reset_rate_limit_bucket_for_tests() -> None:
+    global _rate_limit_bucket, _rate_limit_bucket_rate
+    with _rate_limit_init_lock:
+        _rate_limit_bucket = None
+        _rate_limit_bucket_rate = None
+
+
+def _wrap_adapter_rate_limit(adapter: BaseAdapter, bucket: _TokenBucket) -> None:
+    if getattr(adapter, _RATE_LIMITED_ATTR, False):
+        return
+    original_send = adapter.send
+
+    def rate_limited_send(*args: object, **kwargs: object) -> object:
+        bucket.acquire()
+        return original_send(*args, **kwargs)
+
+    adapter.send = rate_limited_send  # type: ignore[method-assign]
+    setattr(adapter, _RATE_LIMITED_ATTR, True)
+
+
+def configure_rate_limit(session: Session, *, service: str = "atlassian") -> None:
+    """Cap outbound request rate (tokens/second) across the whole process.
+
+    Disabled by default — opt in via env. The bucket is shared across all
+    sessions in the process so the cap protects the upstream Atlassian
+    instance, not each client independently.
+
+    Env knobs:
+      ATLASSIAN_REQUESTS_PER_SECOND (float, default 0 = disabled)
+    """
+    rate = _float_env("ATLASSIAN_REQUESTS_PER_SECOND", 0.0)
+    if rate <= 0:
+        logger.debug("%s: rate limit disabled", service)
+        return
+
+    bucket = _get_rate_limit_bucket(rate)
+    if not session.adapters:
+        return
+    for adapter in session.adapters.values():
+        _wrap_adapter_rate_limit(adapter, bucket)
+    logger.info("%s: rate limit %.2f rps applied", service, rate)
+
+
+def format_rate_limit_error(http_err: object, *, service: str) -> str:
+    """Build a 429 error string that includes Retry-After when the server set it.
+
+    Surfaces the structured backoff hint to the LLM so the agent can pause
+    instead of immediately retrying.
+    """
+    response = getattr(http_err, "response", None)
+    headers = getattr(response, "headers", None) or {}
+    retry_after = headers.get("Retry-After") or headers.get("retry-after")
+    if retry_after:
+        return (
+            f"{service} API rate limit hit (429). "
+            f"Server requested Retry-After: {retry_after} seconds. "
+            "Pause before retrying."
+        )
+    return (
+        f"{service} API rate limit hit (429). "
+        "No Retry-After header provided; back off and retry."
+    )

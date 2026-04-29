@@ -1,11 +1,16 @@
-# MCP Atlassian
+# MCP Atlassian (strvmarv fork)
 
-![PyPI Version](https://img.shields.io/pypi/v/mcp-atlassian)
-![PyPI - Downloads](https://img.shields.io/pypi/dm/mcp-atlassian)
-![PePy - Total Downloads](https://static.pepy.tech/personalized-badge/mcp-atlassian?period=total&units=international_system&left_color=grey&right_color=blue&left_text=Total%20Downloads)
-[![Run Tests](https://github.com/sooperset/mcp-atlassian/actions/workflows/tests.yml/badge.svg)](https://github.com/sooperset/mcp-atlassian/actions/workflows/tests.yml)
-![License](https://img.shields.io/github/license/sooperset/mcp-atlassian)
-[![Docs](https://img.shields.io/badge/docs-mintlify-blue)](https://mcp-atlassian.soomiles.com)
+> Fork of [sooperset/mcp-atlassian](https://github.com/sooperset/mcp-atlassian) with rate-limiting and self-hosted-friendly defaults. Distributed via git tag — no PyPI publishing.
+
+## Install / upgrade
+
+```bash
+uv tool install --force git+https://github.com/strvmarv/mcp-atlassian-strvmarv.git@main
+```
+
+Pin to a release tag instead of `main` for reproducible installs (e.g. `@v0.13.2-strvmarv.1`). The console script is `mcp-atlassian-strvmarv` so it coexists with an upstream install.
+
+---
 
 Model Context Protocol (MCP) server for Atlassian products (Confluence and Jira). Supports both Cloud and Server/Data Center deployments.
 
@@ -35,7 +40,7 @@ Add to your Claude Desktop or Cursor MCP configuration:
   "mcpServers": {
     "mcp-atlassian": {
       "command": "uvx",
-      "args": ["mcp-atlassian"],
+      "args": ["--from", "git+https://github.com/strvmarv/mcp-atlassian-strvmarv.git", "mcp-atlassian-strvmarv"],
       "env": {
         "JIRA_URL": "https://your-company.atlassian.net",
         "JIRA_USERNAME": "your.email@company.com",
