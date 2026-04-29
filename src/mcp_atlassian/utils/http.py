@@ -9,13 +9,14 @@ configure_concurrency.
 """
 
 import logging
-import os
 import threading
 import time
 
 from requests import Session
 from requests.adapters import BaseAdapter
 from urllib3.util.retry import Retry
+
+from .env import get_float_env, get_int_env, is_env_extended_truthy
 
 logger = logging.getLogger("mcp-atlassian.http")
 
@@ -96,10 +97,11 @@ class _CircuitBreaker:
             if self.opened_at is None:
                 return
             if time.monotonic() - self.opened_at >= self.cooldown:
-                # Cooldown elapsed: half-open. Reset state and let the call
-                # through; the response will determine if we re-open.
+                # Half-open: clear opened_at so a request goes through, but
+                # leave failures at threshold so a single 429/503 in
+                # on_response re-opens the breaker immediately. A 2xx will
+                # reset failures to 0 (closed).
                 self.opened_at = None
-                self.failures = 0
                 return
             remaining = self.cooldown - (time.monotonic() - self.opened_at)
             raise CircuitBreakerOpenError(
@@ -129,37 +131,6 @@ _circuit_breaker: _CircuitBreaker | None = None
 _circuit_breaker_init_lock = threading.Lock()
 
 
-def _int_env(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("Invalid int for %s=%r; using default %d", name, raw, default)
-        return default
-
-
-def _float_env(name: str, default: float) -> float:
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid float for %s=%r; using default %s", name, raw, default
-        )
-        return default
-
-
-def _bool_env(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if not raw:
-        return default
-    return raw.strip().lower() in ("1", "true", "yes", "on")
-
-
 def configure_retry(session: Session, *, service: str = "atlassian") -> None:
     """Apply a urllib3 Retry policy to all adapters on the session.
 
@@ -173,13 +144,13 @@ def configure_retry(session: Session, *, service: str = "atlassian") -> None:
     Retries fire on 429, 502, 503, 504 and on connection errors. Retry-After
     header is respected when present.
     """
-    total = _int_env("ATLASSIAN_RETRY_TOTAL", DEFAULT_RETRY_TOTAL)
+    total = get_int_env("ATLASSIAN_RETRY_TOTAL", DEFAULT_RETRY_TOTAL)
     if total <= 0:
         logger.info("%s: retry disabled (ATLASSIAN_RETRY_TOTAL=%d)", service, total)
         return
 
-    backoff = _float_env("ATLASSIAN_RETRY_BACKOFF", DEFAULT_RETRY_BACKOFF)
-    include_writes = _bool_env("ATLASSIAN_RETRY_INCLUDE_WRITES", False)
+    backoff = get_float_env("ATLASSIAN_RETRY_BACKOFF", DEFAULT_RETRY_BACKOFF)
+    include_writes = is_env_extended_truthy("ATLASSIAN_RETRY_INCLUDE_WRITES")
     methods = _ALL_METHODS if include_writes else _READ_METHODS
 
     retry = Retry(
@@ -266,7 +237,7 @@ def configure_concurrency(session: Session, *, service: str = "atlassian") -> No
     Env knobs:
       ATLASSIAN_MAX_CONCURRENT_REQUESTS (int, default 4; <=0 disables)
     """
-    cap = _int_env(
+    cap = get_int_env(
         "ATLASSIAN_MAX_CONCURRENT_REQUESTS", DEFAULT_MAX_CONCURRENT_REQUESTS
     )
     if cap <= 0:
@@ -334,7 +305,7 @@ def configure_rate_limit(session: Session, *, service: str = "atlassian") -> Non
     Env knobs:
       ATLASSIAN_REQUESTS_PER_SECOND (float, default 0 = disabled)
     """
-    rate = _float_env("ATLASSIAN_REQUESTS_PER_SECOND", 0.0)
+    rate = get_float_env("ATLASSIAN_REQUESTS_PER_SECOND", 0.0)
     if rate <= 0:
         logger.debug("%s: rate limit disabled", service)
         return
@@ -387,14 +358,14 @@ def describe_profile() -> str:
     startup banner so users can see what protection is in effect.
     """
     parts = [
-        f"retry={_int_env('ATLASSIAN_RETRY_TOTAL', DEFAULT_RETRY_TOTAL)}",
-        f"concurrency={_int_env('ATLASSIAN_MAX_CONCURRENT_REQUESTS', DEFAULT_MAX_CONCURRENT_REQUESTS)}",
-        f"rps={_float_env('ATLASSIAN_REQUESTS_PER_SECOND', 0.0):g}",
+        f"retry={get_int_env('ATLASSIAN_RETRY_TOTAL', DEFAULT_RETRY_TOTAL)}",
+        f"concurrency={get_int_env('ATLASSIAN_MAX_CONCURRENT_REQUESTS', DEFAULT_MAX_CONCURRENT_REQUESTS)}",
+        f"rps={get_float_env('ATLASSIAN_REQUESTS_PER_SECOND', 0.0):g}",
         (
-            f"breaker={_int_env('ATLASSIAN_CIRCUIT_BREAKER_THRESHOLD', DEFAULT_CIRCUIT_BREAKER_THRESHOLD)}"
-            f"@{_float_env('ATLASSIAN_CIRCUIT_BREAKER_COOLDOWN', DEFAULT_CIRCUIT_BREAKER_COOLDOWN):g}s"
+            f"breaker={get_int_env('ATLASSIAN_CIRCUIT_BREAKER_THRESHOLD', DEFAULT_CIRCUIT_BREAKER_THRESHOLD)}"
+            f"@{get_float_env('ATLASSIAN_CIRCUIT_BREAKER_COOLDOWN', DEFAULT_CIRCUIT_BREAKER_COOLDOWN):g}s"
         ),
-        f"page-cap={_int_env('ATLASSIAN_MAX_PAGINATION_LIMIT', 100)}",
+        f"page-cap={get_int_env('ATLASSIAN_MAX_PAGINATION_LIMIT', 100)}",
     ]
     return " ".join(parts)
 
@@ -412,13 +383,13 @@ def configure_circuit_breaker(
       ATLASSIAN_CIRCUIT_BREAKER_THRESHOLD (int,   default 5; 0 disables)
       ATLASSIAN_CIRCUIT_BREAKER_COOLDOWN  (float, default 30.0 seconds)
     """
-    threshold = _int_env(
+    threshold = get_int_env(
         "ATLASSIAN_CIRCUIT_BREAKER_THRESHOLD", DEFAULT_CIRCUIT_BREAKER_THRESHOLD
     )
     if threshold <= 0:
         logger.info("%s: circuit breaker disabled", service)
         return
-    cooldown = _float_env(
+    cooldown = get_float_env(
         "ATLASSIAN_CIRCUIT_BREAKER_COOLDOWN", DEFAULT_CIRCUIT_BREAKER_COOLDOWN
     )
     breaker = _get_circuit_breaker(threshold, cooldown)
@@ -437,6 +408,10 @@ def configure_circuit_breaker(
 def format_rate_limit_error(http_err: object, *, service: str) -> str:
     """Build a 429 error string that includes Retry-After when the server set it.
 
+    Per RFC 9110 the Retry-After header may be either a delta-seconds integer
+    or an HTTP-date. We label the value as seconds when it parses as int, and
+    otherwise surface the raw header value without making a units claim.
+
     Surfaces the structured backoff hint to the LLM so the agent can pause
     instead of immediately retrying.
     """
@@ -444,9 +419,17 @@ def format_rate_limit_error(http_err: object, *, service: str) -> str:
     headers = getattr(response, "headers", None) or {}
     retry_after = headers.get("Retry-After") or headers.get("retry-after")
     if retry_after:
+        try:
+            seconds = int(str(retry_after).strip())
+        except (TypeError, ValueError):
+            return (
+                f"{service} API rate limit hit (429). "
+                f"Server requested Retry-After: {retry_after}. "
+                "Pause before retrying."
+            )
         return (
             f"{service} API rate limit hit (429). "
-            f"Server requested Retry-After: {retry_after} seconds. "
+            f"Server requested Retry-After: {seconds} seconds. "
             "Pause before retrying."
         )
     return (

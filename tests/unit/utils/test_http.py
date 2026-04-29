@@ -53,7 +53,7 @@ def test_configure_retry_applies_to_all_adapters_with_defaults():
         assert isinstance(retry, Retry)
         assert retry.total == DEFAULT_RETRY_TOTAL
         assert retry.backoff_factor == DEFAULT_RETRY_BACKOFF
-        assert tuple(retry.status_forcelist) == DEFAULT_RETRY_STATUSES
+        assert set(retry.status_forcelist or ()) == set(DEFAULT_RETRY_STATUSES)
         assert retry.respect_retry_after_header is True
         # Default should be reads-only (no POST/PUT/PATCH/DELETE)
         assert "GET" in retry.allowed_methods
@@ -320,6 +320,18 @@ def test_format_rate_limit_error_handles_no_response():
     http_err.response = None
     msg = format_rate_limit_error(http_err, service="Jira")
     assert "429" in msg
+
+
+def test_format_rate_limit_error_handles_http_date_retry_after():
+    """Retry-After can be an HTTP-date per RFC 9110 — surface the raw value
+    without claiming it's in seconds."""
+    from mcp_atlassian.utils.http import format_rate_limit_error
+
+    http_err = MagicMock()
+    http_err.response.headers = {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+    msg = format_rate_limit_error(http_err, service="Jira")
+    assert "Wed, 21 Oct 2026 07:28:00 GMT" in msg
+    assert "seconds" not in msg.lower()
 
 
 def _build_circuit_session(status_codes_iter, monkeypatch):
