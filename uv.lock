@@ -1435,7 +1435,7 @@ cli = [
 
 [[package]]
 name = "mcp-atlassian-strvmarv"
-version = "0.21.2.dev1+d8bc786"
+version = "0.21.2.post0+strvmarv.1"
 source = { editable = "." }
 dependencies = [
     { name = "atlassian-python-api" },

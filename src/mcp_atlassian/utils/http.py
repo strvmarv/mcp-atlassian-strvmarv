@@ -29,6 +29,14 @@ _ALL_METHODS = frozenset(
 )
 _THROTTLED_ATTR = "_strvmarv_throttled"
 _RATE_LIMITED_ATTR = "_strvmarv_rate_limited"
+_CIRCUIT_BREAKER_ATTR = "_strvmarv_circuit_breaker"
+
+DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 5
+DEFAULT_CIRCUIT_BREAKER_COOLDOWN = 30.0
+
+
+class CircuitBreakerOpenError(Exception):
+    """Raised by the circuit breaker when in the open state."""
 
 _concurrency_semaphore: threading.BoundedSemaphore | None = None
 _concurrency_semaphore_cap: int | None = None
@@ -65,6 +73,60 @@ class _TokenBucket:
 _rate_limit_bucket: _TokenBucket | None = None
 _rate_limit_bucket_rate: float | None = None
 _rate_limit_init_lock = threading.Lock()
+
+
+class _CircuitBreaker:
+    """Trip after N consecutive 429/503 responses; fail fast during cooldown.
+
+    closed -> (failures >= threshold) -> open -> (cooldown elapsed) -> half-open
+    -> (next response) -> closed | open. We don't model half-open as a separate
+    state explicitly; cooldown elapsed simply lets one request through which
+    will either reset failures (success) or re-open immediately (failure).
+    """
+
+    def __init__(self, threshold: int, cooldown: float) -> None:
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self.failures = 0
+        self.opened_at: float | None = None
+        self.lock = threading.Lock()
+
+    def before_send(self) -> None:
+        with self.lock:
+            if self.opened_at is None:
+                return
+            if time.monotonic() - self.opened_at >= self.cooldown:
+                # Cooldown elapsed: half-open. Reset state and let the call
+                # through; the response will determine if we re-open.
+                self.opened_at = None
+                self.failures = 0
+                return
+            remaining = self.cooldown - (time.monotonic() - self.opened_at)
+            raise CircuitBreakerOpenError(
+                f"Atlassian circuit breaker open after {self.threshold} consecutive "
+                f"429/503 responses. Cooling down for ~{remaining:.1f}s before "
+                "allowing another request. The upstream server appears overloaded; "
+                "back off and retry later."
+            )
+
+    def on_response(self, status_code: int) -> None:
+        with self.lock:
+            if status_code in (429, 503):
+                self.failures += 1
+                if self.failures >= self.threshold and self.opened_at is None:
+                    self.opened_at = time.monotonic()
+                    logger.warning(
+                        "Circuit breaker tripped after %d consecutive 429/503; "
+                        "cooling down %.1fs",
+                        self.failures,
+                        self.cooldown,
+                    )
+            else:
+                self.failures = 0
+
+
+_circuit_breaker: _CircuitBreaker | None = None
+_circuit_breaker_init_lock = threading.Lock()
 
 
 def _int_env(name: str, default: int) -> int:
@@ -283,6 +345,93 @@ def configure_rate_limit(session: Session, *, service: str = "atlassian") -> Non
     for adapter in session.adapters.values():
         _wrap_adapter_rate_limit(adapter, bucket)
     logger.info("%s: rate limit %.2f rps applied", service, rate)
+
+
+def _get_circuit_breaker(threshold: int, cooldown: float) -> _CircuitBreaker:
+    global _circuit_breaker
+    if _circuit_breaker is not None:
+        return _circuit_breaker
+    with _circuit_breaker_init_lock:
+        if _circuit_breaker is None:
+            _circuit_breaker = _CircuitBreaker(threshold, cooldown)
+    return _circuit_breaker
+
+
+def _reset_circuit_breaker_for_tests() -> None:
+    global _circuit_breaker
+    with _circuit_breaker_init_lock:
+        _circuit_breaker = None
+
+
+def _wrap_adapter_circuit_breaker(
+    adapter: BaseAdapter, breaker: _CircuitBreaker
+) -> None:
+    if getattr(adapter, _CIRCUIT_BREAKER_ATTR, False):
+        return
+    original_send = adapter.send
+
+    def breaker_send(*args: object, **kwargs: object) -> object:
+        breaker.before_send()
+        response = original_send(*args, **kwargs)
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            breaker.on_response(status)
+        return response
+
+    adapter.send = breaker_send  # type: ignore[method-assign]
+    setattr(adapter, _CIRCUIT_BREAKER_ATTR, True)
+
+
+def describe_profile() -> str:
+    """One-line summary of the active HTTP hardening config — for the
+    startup banner so users can see what protection is in effect.
+    """
+    parts = [
+        f"retry={_int_env('ATLASSIAN_RETRY_TOTAL', DEFAULT_RETRY_TOTAL)}",
+        f"concurrency={_int_env('ATLASSIAN_MAX_CONCURRENT_REQUESTS', DEFAULT_MAX_CONCURRENT_REQUESTS)}",
+        f"rps={_float_env('ATLASSIAN_REQUESTS_PER_SECOND', 0.0):g}",
+        (
+            f"breaker={_int_env('ATLASSIAN_CIRCUIT_BREAKER_THRESHOLD', DEFAULT_CIRCUIT_BREAKER_THRESHOLD)}"
+            f"@{_float_env('ATLASSIAN_CIRCUIT_BREAKER_COOLDOWN', DEFAULT_CIRCUIT_BREAKER_COOLDOWN):g}s"
+        ),
+        f"page-cap={_int_env('ATLASSIAN_MAX_PAGINATION_LIMIT', 100)}",
+    ]
+    return " ".join(parts)
+
+
+def configure_circuit_breaker(
+    session: Session, *, service: str = "atlassian"
+) -> None:
+    """Trip a process-wide circuit breaker after N consecutive 429/503 responses.
+
+    When tripped, in-flight Sessions raise CircuitBreakerOpenError immediately
+    instead of waiting on the per-request timeout (default 75s) for each
+    additional doomed request.
+
+    Env knobs:
+      ATLASSIAN_CIRCUIT_BREAKER_THRESHOLD (int,   default 5; 0 disables)
+      ATLASSIAN_CIRCUIT_BREAKER_COOLDOWN  (float, default 30.0 seconds)
+    """
+    threshold = _int_env(
+        "ATLASSIAN_CIRCUIT_BREAKER_THRESHOLD", DEFAULT_CIRCUIT_BREAKER_THRESHOLD
+    )
+    if threshold <= 0:
+        logger.info("%s: circuit breaker disabled", service)
+        return
+    cooldown = _float_env(
+        "ATLASSIAN_CIRCUIT_BREAKER_COOLDOWN", DEFAULT_CIRCUIT_BREAKER_COOLDOWN
+    )
+    breaker = _get_circuit_breaker(threshold, cooldown)
+    if not session.adapters:
+        return
+    for adapter in session.adapters.values():
+        _wrap_adapter_circuit_breaker(adapter, breaker)
+    logger.debug(
+        "%s: circuit breaker armed threshold=%d cooldown=%.1fs",
+        service,
+        threshold,
+        cooldown,
+    )
 
 
 def format_rate_limit_error(http_err: object, *, service: str) -> str:

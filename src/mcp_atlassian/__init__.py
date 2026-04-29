@@ -292,8 +292,11 @@ def main(
 
     global logger
     logger = setup_logging(current_logging_level, logging_stream)
+    from mcp_atlassian.utils.http import describe_profile
+
     logger.warning(
-        f"mcp-atlassian-strvmarv {__version__} (fork of sooperset/mcp-atlassian)"
+        f"mcp-atlassian-strvmarv {__version__} (fork of sooperset/mcp-atlassian) | "
+        f"{describe_profile()}"
     )
     logger.debug(f"Logging level set to: {logging.getLevelName(current_logging_level)}")
     logger.debug(

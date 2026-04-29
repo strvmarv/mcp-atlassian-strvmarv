@@ -32,10 +32,12 @@ def test_stdio_homebrew_probe_exits_after_stdin_close() -> None:
     )
 
     result = subprocess.run(
-        ["uv", "run", "mcp-atlassian"],
+        ["uv", "run", "mcp-atlassian-strvmarv"],
         input=_build_probe_payload(),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=env,
         check=False,
         timeout=15,
